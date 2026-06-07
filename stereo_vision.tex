@@ -1,0 +1,613 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+
+\title{Calibration-Free Stereo Depth via a Trainable Anisotropic $\gamma$-Grid\\
+\large A Computer Vision Project Report}
+\author{Roman Sahakyan}
+\date{2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present a stereo depth estimation pipeline that replaces the classical pinhole intrinsic
+matrix with a learnable anisotropic $\gamma$-grid, trained from a handful of in-scene click
+pairs whose ground-truth distances are known. The system requires no calibration target
+(no checkerboard), runs in pure NumPy with hand-derived analytical gradients, and trains
+in well under a second on a CPU. We benchmark it against a classical pinhole-OLS baseline
+on $43$ tape-measured points spanning $1.35$–$8.75$\,m. Under leave-one-out cross-validation
+the $\gamma$-grid plus a 3-parameter quadratic post-correction reduces mean absolute depth
+error from $0.373$\,m (pinhole) to $0.269$\,m, a $28\%$ improvement; it cuts the maximum
+single-point error from $2.56$\,m to $1.85$\,m. We document an honest overfitting gap
+between in-sample and held-out evaluation and a mirror tradeoff between the two methods on
+near versus far points, both of which motivate concrete future work.
+\end{abstract}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Problem and Motivation}
+
+The textbook recipe for stereo depth from two consumer cameras starts with intrinsic
+calibration via Zhang's algorithm: roughly twenty checkerboard images per camera are
+required, and the result still assumes a single radial-tangential distortion model per
+camera. We pose the inverse question: \emph{given a stereo pair with unknown intrinsics,
+can we recover metric depth using only a handful of in-scene click pairs whose ground-truth
+distance is known?}
+
+Our setting is operationally simple. The user supplies $\geq 15$ calibration clicks of
+the form $(u_L, v_L, u_R, v_R, Z_\text{true})$, where $Z_\text{true}$ is measured with a
+tape; afterwards the system triangulates any newly clicked point in real time. We
+constrain the implementation to pure NumPy with no heavyweight ML framework so that the
+pipeline is reproducible from a single $\sim$1000-line script and trains in well under a
+second on a CPU.
+
+This fits both the \emph{Monocular Depth \& Scale Recovery} and \emph{Structure from
+Motion / 3D Reconstruction} topics from the syllabus, with the twist that absolute
+scale is recovered by user-supplied known distances rather than by monocular cues.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Baseline: Classical Pinhole Triangulation}
+\label{sec:baseline}
+
+The classical two-view triangulator treats each pixel as a 3-D ray and solves a
+skew-line intersection in least-squares form. We summarize the derivation in this
+section because the same OLS solve is reused inside our $\gamma$-grid method
+(\S\ref{sec:method}).
+
+\subsection{Geometry of two camera rays}
+
+Camera 1 is located at a 3-D point $P_1 = [x_1, y_1, z_1]^\top$ with a normalized ray
+direction $\vec d_1 = [u_1, v_1, w_1]^\top$; camera 2 likewise with $P_2$ and $\vec
+d_2$. A point at distance $t_i$ along ray $i$ is
+\begin{align*}
+L_1(t_1) &= P_1 + t_1 \vec d_1, &
+L_2(t_2) &= P_2 + t_2 \vec d_2.
+\end{align*}
+If the lines intersect, $P_1 + t_1 \vec d_1 = P_2 + t_2 \vec d_2$, which rearranges to
+\[
+t_1 \vec d_1 - t_2 \vec d_2 = P_2 - P_1.
+\]
+
+\subsection{The matrix-vector equation $Ax = b$}
+
+Expanding component-wise yields a linear system
+\[
+\underbrace{\begin{bmatrix} u_1 & -u_2\\ v_1 & -v_2\\ w_1 & -w_2 \end{bmatrix}}_{A}
+\underbrace{\begin{bmatrix} t_1\\t_2 \end{bmatrix}}_{x}
+=
+\underbrace{\begin{bmatrix} x_2-x_1\\y_2-y_1\\z_2-z_1 \end{bmatrix}}_{b}.
+\]
+$A$ has $3$ rows and $2$ columns: overdetermined. Pixel noise guarantees the rays will
+not intersect exactly, so no exact solution exists.
+
+\subsection{L2-norm error and OLS solution}
+
+Define the residual $e = Ax - b$ and minimize $\|e\|_2^2$:
+\begin{align*}
+E(x) &= (Ax-b)^\top (Ax-b) = x^\top A^\top A x - 2 b^\top A x + b^\top b.
+\end{align*}
+This is a convex quadratic with gradient
+\[
+\nabla E(x) = 2 A^\top A x - 2 A^\top b.
+\]
+Setting $\nabla E = 0$ yields the normal equations and the closed-form OLS solution
+\begin{equation}
+A^\top A x = A^\top b \quad\Longrightarrow\quad x = (A^\top A)^{-1} A^\top b.
+\label{eq:ols}
+\end{equation}
+The optimal $(t_1, t_2)$ are obtained in one step; for educational reference we note that
+the same minimum is reachable by gradient descent $x_{k+1} = x_k - \alpha (2 A^\top A x_k -
+2 A^\top b)$, which converges because $E$ is convex.
+
+\subsection{Final 3-D point and error distance}
+
+With optimal $(t_1, t_2)$, the closest points on each ray are
+\begin{align*}
+P_1^\ast &= P_1 + t_1 \vec d_1, &
+P_2^\ast &= P_2 + t_2 \vec d_2.
+\end{align*}
+Because the lines are skew, the points do not coincide; the best estimate of the true 3-D
+object is the midpoint and the reconstruction error is the gap between the two:
+\[
+\hat P = \tfrac{1}{2}(P_1^\ast + P_2^\ast), \qquad
+\epsilon = \|P_1^\ast - P_2^\ast\|_2.
+\]
+
+\subsection{Why the pinhole baseline is insufficient}
+
+The OLS triangulator is mathematically clean but assumes (i) perfect pinhole optics with
+no radial or tangential distortion, (ii) a single focal length per camera, and (iii)
+\emph{known} intrinsics. For a consumer stereo rig with unknown intrinsics we can still
+fit a single scalar focal length per camera plus the baseline $(d_x, d_y)$, but this
+4-parameter model leaves systematic bias at the image edges where lens distortion
+dominates. Our experiments (\S\ref{sec:exp}) confirm this: the pinhole baseline achieves
+$0.180$\,m mean absolute error on near-image points where geometry dominates but degrades
+to $0.448$\,m on far points where distortion matters more.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Methodology: Anisotropic $\gamma$-Grid Stereo}
+\label{sec:method}
+
+We replace the single focal length per camera with a learnable $3 \times 3$ grid of
+inverse focal lengths, separately for the $x$ and $y$ image axes. The grid is bilinearly
+interpolated to produce a smooth per-pixel distortion correction without any polynomial
+distortion coefficients. Triangulation itself is unchanged from \S\ref{sec:baseline} ---
+we modify \emph{which rays we feed in}, not \emph{how we triangulate them}.
+
+\subsection{Pixel and normalized coordinates}
+
+Working directly in pixel coordinates $(u, v)$ is numerically unstable for optimization.
+We normalize relative to the optical center $(C_X, C_Y) = (W/2, H/2)$:
+\begin{equation}
+u_n = \frac{u - C_X}{C_X}, \qquad v_n = \frac{v - C_Y}{C_Y}.
+\label{eq:norm}
+\end{equation}
+Normalized coordinates are centered at $0$ and generally fall in $[-1, 1]$, decoupling the
+image resolution from the optimization space.
+
+\subsection{Ray equation}
+
+A pixel $(u, v)$ defines a 3-D ray shot from the camera's optical center. Our ray model is
+\begin{equation}
+r = \begin{bmatrix} u_n \gamma_x \\ v_n \gamma_y \\ 1 \end{bmatrix},
+\label{eq:ray}
+\end{equation}
+where $\gamma_x$ and $\gamma_y$ are effective inverse focal lengths (in a perfect pinhole
+camera $\gamma_x = C_X / f_x$). By letting $\gamma$ \emph{vary across the image} we
+inherently model lens distortion without any polynomial distortion coefficients.
+
+\subsection{Bilinear $\gamma$ interpolation}
+
+To make $\gamma(u, v)$ smooth and cheap we tile the image with a $3 \times 3$ grid of
+trainable nodes $g_{ij}$ (cell dimensions $\text{CELL\_W} = W/2$, $\text{CELL\_H} = H/2$).
+Mapping $(u, v)$ to continuous grid coordinates
+\begin{equation}
+f_x = u / \text{CELL\_W}, \qquad f_y = v / \text{CELL\_H},
+\end{equation}
+we identify the top-left integer node $(i_x, i_y)$ and the fractional distances $t_x =
+f_x - i_x$, $t_y = f_y - i_y$. The interpolated value is the weighted sum of the four
+surrounding nodes:
+\begin{equation}
+g(u, v) = (1 - t_x)(1 - t_y) g_{00} + t_x (1 - t_y) g_{10} + (1 - t_x) t_y g_{01} + t_x t_y g_{11}.
+\label{eq:bilinear}
+\end{equation}
+This guarantees $C^0$ continuity, costs four multiplications per query, and is $O(1)$.
+
+\subsection{Anisotropic grid: $\gamma_x \neq \gamma_y$}
+
+Traditional pinhole models assume one focal length per camera and symmetric radial
+distortion. We maintain two grids per camera, one for $\gamma_x$ and one for $\gamma_y$,
+yielding a parameter tensor $\Gamma$ of shape $(R, C, 2)$. The motivation is threefold:
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{Sensor non-uniformity:} pixels are rarely square, so $f_x \neq f_y$.
+  \item \textbf{Asymmetric distortion:} manufacturing defects in lenses are not perfectly
+        circular.
+  \item \textbf{Decoupled gradients:} $\gamma_x$ strictly handles horizontal disparity
+        (the depth signal); $\gamma_y$ strictly handles epipolar Y-alignment.
+\end{enumerate}
+
+\subsection{Stereo geometry and triangulation}
+
+For a matched click pair $(u_L, v_L)$ in the left image and $(u_R, v_R)$ in the right,
+equation~\eqref{eq:ray} produces two rays $v_L$ and $v_R$. Let $Z$ be the depth along the
+left camera's axis and $Z_R$ the depth along the right; with baseline $d = [d_x, d_y, 0]^\top$
+the geometric constraint $P_L = d + P_R$ becomes
+\begin{equation}
+Z v_L - Z_R v_R = d \quad\Longrightarrow\quad
+\underbrace{\begin{bmatrix} | & | \\ v_L & -v_R \\ | & | \end{bmatrix}}_{A}
+\underbrace{\begin{bmatrix} Z \\ Z_R \end{bmatrix}}_{x} = d.
+\end{equation}
+The overdetermined system is solved by the same OLS step from~\eqref{eq:ols}:
+\begin{equation}
+x = (A^\top A)^{-1} A^\top d, \qquad Z = x_1.
+\label{eq:tri}
+\end{equation}
+
+\subsection{Disparity}
+
+In our ray space, horizontal disparity is $\text{disp} = v_{Lx} - v_{Rx}$. When $Z \gg
+d_x$ we have $Z \approx Z_R$ and equation~\eqref{eq:tri} gives the well-known inverse
+relation
+\begin{equation}
+\text{disp} \approx \frac{d_x}{Z}.
+\end{equation}
+This explains why stereo is precise at short range (large disparity) and imprecise at long
+range (disparity $\to 0$).
+
+\subsection{Loss design}
+
+A naive $L = (Z_\text{pred} - Z_\text{true})^2$ is unstable because $Z \propto
+1/\text{disp}$: a one-pixel error at $10$\,m produces an order of magnitude larger
+gradient than at $1$\,m. We therefore optimize in ray-disparity space.
+
+\paragraph{Relative disparity loss ($L_{1D}$).} Define $\text{disp}_\text{true} = d_x /
+Z_\text{true}$ and the unit-less relative error
+\begin{equation}
+e_x = \frac{v_{Lx} - v_{Rx}}{\text{disp}_\text{true}} - 1 = \frac{(v_{Lx} - v_{Rx}) Z_\text{true}}{d_x} - 1,
+\qquad L_{1D} = \tfrac{1}{2} e_x^2.
+\label{eq:l1d}
+\end{equation}
+This formulation treats a $5\%$ depth error at $1$\,m identically to a $5\%$ error at
+$10$\,m, stabilizing optimization.
+
+\paragraph{Epipolar Y-alignment loss ($L_Y$).} For perfect stereo the vertical ray
+components should match the physical vertical baseline:
+\begin{equation}
+e_y = (v_{Ly} - v_{Ry}) - \frac{d_y}{Z_\text{true}}, \qquad L_Y = \tfrac{1}{2} e_y^2.
+\label{eq:ly}
+\end{equation}
+This forces the network to learn $\gamma_y$ such that epipolar lines become horizontal in
+ray space.
+
+\paragraph{Huber robustness.} Human calibration clicks contain outliers. Standard MSE
+chases them; we wrap each error in a Huber loss with $\delta = 0.05$ (a $5\%$
+relative-error threshold):
+\begin{equation}
+L_\delta(e) =
+\begin{cases}
+\tfrac{1}{2} e^2,                       & |e| \leq \delta,\\
+\delta \big(|e| - \tfrac{1}{2}\delta\big), & |e| > \delta,
+\end{cases}
+\qquad
+\frac{\partial L_\delta}{\partial e} =
+\begin{cases}
+e,                  & |e| \leq \delta,\\
+\delta \cdot \text{sign}(e), & |e| > \delta.
+\end{cases}
+\label{eq:huber}
+\end{equation}
+Beyond $\delta$ the gradient magnitude is capped at $\delta$, bounding outlier influence.
+
+\subsection{Analytical gradients}
+
+We do not use automatic differentiation. All gradients are derived analytically using the
+chain rule. Let $D = v_{Lx} - v_{Rx}$. Inside the Huber quadratic region:
+\begin{equation}
+\frac{\partial L}{\partial D} = e_x \cdot \frac{Z_\text{true}}{d_x},
+\qquad
+\frac{\partial L}{\partial v_{Lx}} = +\frac{\partial L}{\partial D},
+\qquad
+\frac{\partial L}{\partial v_{Rx}} = -\frac{\partial L}{\partial D},
+\end{equation}
+\begin{equation}
+\frac{\partial L}{\partial v_{Ly}} = e_y,
+\qquad
+\frac{\partial L}{\partial v_{Ry}} = -e_y.
+\end{equation}
+From \eqref{eq:ray}, $v_{Lx} = u_{nL} \gamma_{xL}$, so $\partial v_{Lx} / \partial \gamma_{xL} =
+u_{nL}$; from \eqref{eq:bilinear}, $\gamma_{xL} = \sum_{k=1}^4 w_k g_k$ where $w_k$ are
+the bilinear weights. Composing,
+\begin{equation}
+\frac{\partial L}{\partial g_k}
+= \frac{\partial L}{\partial v_{Lx}} \cdot u_{nL} \cdot w_k.
+\label{eq:dLdg}
+\end{equation}
+Gradients with respect to the baseline are
+\begin{equation}
+\frac{\partial L}{\partial d_x} = e_x \cdot \left(-\frac{D\, Z_\text{true}}{d_x^2}\right),
+\qquad
+\frac{\partial L}{\partial d_y} = e_y \cdot \left(-\frac{1}{Z_\text{true}}\right).
+\end{equation}
+Outside the Huber quadratic region, every $e_\bullet$ in the equations above is replaced
+by $\delta \cdot \text{sign}(e_\bullet)$. The exact logic above is implemented in
+\texttt{forward\_grads(\dots)} in \texttt{stereo\_app.py}.
+
+\subsection{Adam optimizer}
+
+For any parameter $\theta \in \{\Gamma_L, \Gamma_R, d\}$ with gradient $g_t$ at step $t$:
+\begin{align}
+m_t &= \beta_1 m_{t-1} + (1 - \beta_1) g_t, &
+v_t &= \beta_2 v_{t-1} + (1 - \beta_2) g_t^2, \\
+\hat m_t &= m_t / (1 - \beta_1^t), &
+\hat v_t &= v_t / (1 - \beta_2^t), \\
+\theta_t &= \theta_{t-1} - \eta \, \hat m_t / (\sqrt{\hat v_t} + \epsilon).
+\end{align}
+We use $\beta_1 = 0.9$, $\beta_2 = 0.999$, $\epsilon = 10^{-8}$. Different parameters get
+different learning rates because they live on vastly different scales: $\eta_\Gamma =
+10^{-1}$ (dimensionless, $\sim 0.45$) and $\eta_d = 10^{-3}$ (meters, $\sim 0.1$). A
+\texttt{ReduceLROnPlateau} schedule halves all three rates after $800$ epochs without
+improvement, and early stopping triggers after $3000$ stalled epochs.
+
+\subsection{Regularization}
+
+With $36$ grid parameters per camera ($+$ baseline) and only $\sim 15$--$40$ calibration
+points, overfitting is a real risk. We add two regularization terms directly to the
+gradients.
+
+\paragraph{Anchor prior.} Pulls $\Gamma$ toward its physical initial value $G_0 = C_X /
+F_\text{init}$:
+\begin{equation}
+\nabla_\text{anchor} = \lambda_a (\Gamma - G_0).
+\end{equation}
+Unused grid cells therefore stay physically sensible rather than drifting.
+
+\paragraph{Smoothness Laplacian.} Adjacent nodes should be similar. The 4-neighbor
+discrete Laplacian is
+\begin{equation}
+\nabla^2 G_{i,j} \approx 4 G_{i,j} - G_{i-1,j} - G_{i+1,j} - G_{i,j-1} - G_{i,j+1},
+\end{equation}
+and adding $\lambda_s \nabla^2 G$ to the gradient makes the grid behave like an elastic
+sheet. We use $\lambda_a = \lambda_s = 10^{-3}$.
+
+\subsection{Polynomial post-correction}
+
+After the $\gamma$-grid converges, slight systematic biases may remain due to unmodeled
+physics (lens thickness, sensor non-linearity). We absorb the residual by fitting a 1-D
+quadratic on the calibration set:
+\begin{equation}
+Z_\text{true} = a + b\, Z_\text{pred} + c\, Z_\text{pred}^2,
+\end{equation}
+solved instantly by ordinary least squares on a Vandermonde matrix of $Z_\text{pred}$.
+This adds $3$ parameters; on our data the fit is $(a, b, c) = (0.020, 0.944, 0.015)$.
+
+\subsection{Numerical stability safeguards}
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{Parallel rays:} if $|v_{Lx} - v_{Rx}| < 10^{-9}$ the depth is undefined;
+        the code returns \texttt{NaN}.
+  \item \textbf{Near-singular $A^\top A$:} falls back to the 1-D disparity formula $Z =
+        d_x / D$.
+  \item \textbf{$\Gamma$ clipping:} values are clipped to $[0.05, 5.0]$, preventing
+        negative or infinite effective focal lengths.
+  \item \textbf{Minimum baseline:} $d_x \geq 0.02$\,m, preventing division by zero in
+        \eqref{eq:l1d}.
+\end{enumerate}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Auxiliary Components}
+
+\subsection{Fundamental matrix for click assistance}
+
+To help the user click matching points, the UI draws an epipolar line in the right image
+whenever the user clicks the left. The fundamental matrix $F$ maps a left point $x_L$ to a
+right line $\ell_R = F x_L$. We construct $F$ locally from the per-pixel $\gamma$ values:
+\begin{equation}
+K_L^{-1} = \begin{bmatrix}
+\gamma_{xL}/C_X & 0 & -\gamma_{xL} \\
+0 & \gamma_{yL}/C_Y & -\gamma_{yL} \\
+0 & 0 & 1
+\end{bmatrix},
+\qquad
+E = [d]_\times = \begin{bmatrix}
+0 & -d_z & d_y \\
+d_z & 0 & -d_x \\
+-d_y & d_x & 0
+\end{bmatrix},
+\end{equation}
+\begin{equation}
+F = K_R^{-\top} E\, K_L^{-1}, \qquad
+[a, b, c]^\top = F [u_L, v_L, 1]^\top,
+\end{equation}
+yielding the epipolar line $a u_R + b v_R + c = 0$. Because the right pixel is not yet
+known we approximate $K_R^{-1}$ using the mean of $\Gamma_R$.
+
+\subsection{Zero-mean NCC matching}
+
+A 1-D search along the epipolar line picks the integer pixel with maximum zero-mean
+normalized cross-correlation between a left patch $A$ and a right patch $B$:
+\begin{equation}
+\text{ZNCC}(A, B) = \frac{\sum_i (A_i - \bar A)(B_i - \bar B)}{\sqrt{\sum_i (A_i - \bar A)^2}\sqrt{\sum_i (B_i - \bar B)^2}} \in [-1, 1].
+\end{equation}
+Mean subtraction gives brightness invariance; variance normalization gives contrast
+invariance. The peak is refined to sub-pixel precision by fitting a parabola to the best
+score and its two neighbors $(s_{-1}, s_0, s_{+1})$:
+\begin{equation}
+\Delta = \frac{s_{-1} - s_{+1}}{2(s_{-1} - 2 s_0 + s_{+1})},
+\qquad u_\text{refined} = u_\text{best} + \Delta.
+\end{equation}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Experiments}
+\label{sec:exp}
+
+\subsection{Dataset and protocol}
+
+We collected $43$ hand-clicked stereo pairs across six scenes with ground-truth distances
+measured by tape. Z range: $1.35$--$8.75$\,m; $12$ near points (Z $< 3$\,m) and $31$ far
+points (Z $\geq 3$\,m). Image resolution is $2592 \times 1944$. We compare three
+configurations:
+\begin{enumerate}[leftmargin=2em]
+  \item[\textbf{A.}] \textbf{Pinhole OLS baseline} --- one scalar $\gamma$ per camera plus
+        $(d_x, d_y)$: $4$ parameters. Trained with the same loss as our full method, so
+        the comparison isolates model capacity rather than loss design.
+  \item[\textbf{B.}] \textbf{$\gamma$-grid only} --- anisotropic $3{\times}3{\times}2$ grid
+        per camera plus baseline: $38$ parameters.
+  \item[\textbf{C.}] \textbf{$\gamma$-grid + post-correction} --- B plus the 3-parameter
+        quadratic.
+\end{enumerate}
+We report (i) \emph{in-sample fit} --- train on all $43$, evaluate on the same $43$ --- and
+(ii) \emph{leave-one-out cross-validation}: $43$ folds of train-on-$42$, test-on-$1$. LOO
+is the honest generalization estimator at this dataset size. Metrics: mean absolute error
+(MAE, m), mean absolute percentage error (MAPE, \%), maximum absolute error (m), plus a
+near/far MAE breakdown at the $3$\,m boundary.
+
+\subsection{Results}
+
+\begin{table}[h]
+\centering
+\caption{In-sample fit (trained and evaluated on the same $43$ points).}
+\label{tab:in_sample}
+\begin{tabular}{lrrrrr}
+\toprule
+Configuration & MAE (m) & MAPE (\%) & Max (m) & Near MAE & Far MAE \\
+\midrule
+A) Pinhole OLS                & 0.373 & 8.39 & 2.487 & 0.181 & 0.447 \\
+B) $\gamma$-grid              & 0.145 & 3.90 & 0.694 & 0.119 & 0.156 \\
+C) $\gamma$-grid + post-corr. & \textbf{0.116} & \textbf{3.46} & \textbf{0.545} & \textbf{0.115} & \textbf{0.117} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Leave-one-out cross-validation ($n = 43$).}
+\label{tab:loo}
+\begin{tabular}{lrrrrr}
+\toprule
+Configuration & MAE (m) & MAPE (\%) & Max (m) & Near MAE & Far MAE \\
+\midrule
+A) Pinhole OLS                & 0.373 & 8.36 & 2.563 & \textbf{0.180} & 0.448 \\
+B) $\gamma$-grid              & 0.300 & 9.04 & 1.792 & 0.373 & 0.271 \\
+C) $\gamma$-grid + post-corr. & \textbf{0.269} & 8.62 & 1.854 & 0.372 & \textbf{0.229} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Discussion}
+
+\paragraph{The $\gamma$-grid captures real distortion structure.} On the in-sample fit it
+reduces MAE $2.6\times$ over the pinhole baseline ($0.373 \to 0.145$\,m) and the maximum
+error drops $3.6\times$ ($2.49 \to 0.69$\,m). The drop is consistent across the Z range,
+indicating the per-pixel anisotropic distortion model is doing genuine work, not just
+fitting noise. The saved calibration shows $\gamma_x$ values ranging from $0.28$ to
+$0.54$ across the grid --- a $90\%$ spread --- confirming the grid did not collapse to a
+constant. The recovered baseline $d_x = 0.233$\,m and $d_y = 0.0005$\,m matches the
+physical camera mount within sub-millimeter tolerance.
+
+\paragraph{Overfitting is also real.} The LOO MAE doubles from $0.145$\,m (in-sample) to
+$0.300$\,m, the expected price of $38$ parameters fit on $\sim 42$ points per fold even
+with our anchor and Laplacian regularization. The pinhole baseline is rock-stable across
+the in-sample/LOO split ($0.373 \to 0.373$) because $4$ parameters cannot overfit at this
+scale --- this makes the in-sample/LOO gap the cleanest evidence of $\gamma$-grid
+overfitting.
+
+\paragraph{Near versus far reveals a mirror tradeoff.} The most interesting analytical
+finding from Table~\ref{tab:loo} is that the two methods are opposites:
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{Pinhole is good near, bad far} ($0.180$\,m near vs $0.448$\,m far). Near
+        points have large disparities, so the geometry dominates the distortion error.
+  \item \textbf{$\gamma$-grid is bad near, good far} ($0.373$\,m near vs $0.271$\,m far).
+        The grid spends its capacity on far-point distortion correction where it matters
+        most, and over-fits the near regime.
+  \item Post-correction improves far-point MAE further ($0.271 \to 0.229$\,m) but cannot
+        rescue near points --- a single global quadratic cannot undo overfitting that is
+        locally heterogeneous.
+\end{itemize}
+This suggests two principled mitigations not pursued in this work: stronger
+$\lambda_\text{anchor}$ in the near-image region, or reducing the grid to $2 \times 2$
+and relying on the post-correction quadratic to capture remaining spatial variation.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Comparison with Existing Methods}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{p{3.2cm} p{3.5cm} p{3.5cm} p{3.3cm} p{1.8cm}}
+\toprule
+Method & Calibration input & Distortion model & Output & Library \\
+\midrule
+Zhang 2000 (\texttt{cv2.stereoCalibrate}) & $\sim$20 checkerboard images & $k_1, k_2, k_3, p_1, p_2$ & full intrinsics + extrinsics & OpenCV \\
+OpenCV SGBM & requires prior $K, R, t$ & uses given $K$ & dense disparity map & OpenCV \\
+Hartley \& Zisserman MVG, ch.\,12 & known fundamental matrix & none & sparse triangulation & --- \\
+\textbf{Ours} & $\geq 15$ in-scene clicks at known Z & learned $3{\times}3{\times}2$ $\gamma$-grid & sparse depth + post-corr & pure NumPy \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The honest comparison: we lose the dense disparity map that SGBM produces and we require
+ground-truth distances during calibration. We gain target-free deployment, an
+order-of-magnitude lower parameter count than Zhang's intrinsic + distortion model, and
+an anisotropic distortion model that is in principle more general than 1-D radial. Our
+framework also produces an explicit fundamental matrix per click via $F = K_R^{-\top} [d]_\times K_L^{-1}$, which we use to draw the epipolar line in the right image and run
+ZNCC sub-pixel matching for click-assist.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Failure Cases and Limitations}
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{Parallel rays.} When $|v_{Lx} - v_{Rx}| < 10^{-9}$ the triangulation
+        system is singular and we return \texttt{NaN}. Happens for very distant or
+        near-coplanar viewing geometry.
+  \item \textbf{Disparity collapse at long range.} Beyond $\sim 10$\,m on our rig the
+        disparity approaches the click-noise floor and depth uncertainty grows as $Z^2$
+        regardless of model capacity.
+  \item \textbf{Near-region overfitting.} Documented in Table~\ref{tab:loo} and
+        \S\ref{sec:exp}. Acceptable for a click-based measurement tool but problematic for
+        dense reconstruction.
+  \item \textbf{Outlier clicks survive Huber.} A click on the wrong object cannot be
+        rejected by any robust loss --- only by RANSAC-style consensus, which we did not
+        implement.
+\end{enumerate}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Future Work}
+
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{Stronger regularization}, especially in the near-image region, to close
+        the in-sample / LOO gap.
+  \item \textbf{Multi-scale grids} ($3 \times 3$ refining into $9 \times 9$) for capturing
+        high-frequency local lens distortions.
+  \item \textbf{Uncertainty estimation} via the covariance of $x = (A^\top A)^{-1} A^\top
+        d$, producing confidence intervals on $Z$.
+  \item \textbf{Bundle adjustment}: jointly optimize 3-D point positions alongside camera
+        parameters to minimize reprojection error.
+  \item \textbf{RANSAC outlier rejection} during calibration, complementing the Huber
+        loss.
+\end{itemize}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Conclusion}
+
+We presented a stereo depth pipeline that replaces classical pinhole intrinsics with a
+trainable anisotropic $\gamma$-grid, calibrated from a handful of in-scene clicks at
+known distances. The method reduces leave-one-out mean absolute depth error from
+$0.373$\,m to $0.269$\,m versus a pinhole-OLS baseline on tape-measured points in
+$1.35$--$8.75$\,m range, with the largest gains on far points where distortion matters
+most. The same experiments expose an overfitting gap and a near/far tradeoff that
+suggest concrete next steps. \medskip
+
+\noindent\textit{Takeaway: don't calibrate the lens --- calibrate the rays.}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section*{Appendix A. Pipeline at a Glance}
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{Pixel click:} user selects $(u_L, v_L)$ in the left image.
+  \item \textbf{Ray generation:} bilinear $\gamma$ lookup $\to$ ray $v_L$ via \eqref{eq:ray}.
+  \item \textbf{Epipolar search:} build local fundamental matrix $F$; ZNCC along the line
+        in the right image $\to (u_R, v_R)$ with sub-pixel refinement.
+  \item \textbf{Triangulation:} OLS solve \eqref{eq:tri} $\to$ raw $Z$.
+  \item \textbf{Correction:} quadratic $Z_\text{true} = a + b Z + c Z^2$ $\to$ final
+        physical distance.
+\end{enumerate}
+
+\section*{Appendix B. Computational Complexity}
+
+\begin{itemize}[leftmargin=2em]
+  \item Bilinear interpolation: $O(1)$ per point, 4 multiplications.
+  \item Triangulation: $O(1)$ via a $2 \times 2$ matrix solve.
+  \item Training: $O(N \cdot E)$ for $N$ points and $E$ epochs. With $N \approx 40$ and
+        $E \leq 20000$, total operations are $\sim 10^6$, sub-second on a modern CPU.
+  \item ZNCC matching: $O(S \cdot P^2)$ where $S \approx 300$ px is the search range and
+        $P = 15$ the patch size $\approx 67{,}000$ ops per click.
+\end{itemize}
+
+\section*{Appendix C. Function $\leftrightarrow$ Math Mapping}
+
+\begin{itemize}[leftmargin=2em]
+  \item \texttt{bilinear(u, v, Gamma)} $\leftrightarrow$ Equation~\eqref{eq:bilinear}.
+  \item \texttt{build\_ray(u, v, Gamma)} $\leftrightarrow$ Equations~\eqref{eq:norm} and \eqref{eq:ray}.
+  \item \texttt{triangulate(\dots)} $\leftrightarrow$ Equation~\eqref{eq:tri}: builds $A$ and calls \texttt{np.linalg.solve(AtA, Atd)}.
+  \item \texttt{forward\_grads(\dots)} $\leftrightarrow$ Equations~\eqref{eq:l1d}--\eqref{eq:dLdg}: relative-disparity loss, Huber clipping, chain rule to $\Gamma_L, \Gamma_R, d$.
+  \item \texttt{train(\dots)} $\leftrightarrow$ Adam optimizer and regularization.
+  \item \texttt{fundamental\_matrix\_local(\dots)} $\leftrightarrow$ $K_L^{-1}$, $E$, $F$.
+  \item \texttt{epipolar\_guided\_match(\dots)} $\leftrightarrow$ ZNCC and parabolic refinement.
+  \item \texttt{fit\_postcorrection(\dots)} $\leftrightarrow$ Vandermonde solve for $(a, b, c)$.
+\end{itemize}
+
+\section*{Reproducibility}
+
+\begin{itemize}[leftmargin=2em]
+  \item Code: \texttt{stereo\_app.py} (full system), \texttt{experiments/run\_experiments.py} (this study).
+  \item Data: \texttt{calibration\_points.json} ($43$ clicks), \texttt{stereo\_calibration.json} (saved $\gamma$-grid).
+  \item Math reference: \texttt{docs/baseline\_classical\_stereo.tex}, \texttt{docs/final\_gamma\_grid\_method.tex}.
+  \item Raw numerical results: \texttt{experiments/results.json}.
+  \item Seed: \texttt{0} (numpy default RNG and \texttt{VAL\_SEED = 0}); LOO is deterministic.
+\end{itemize}
+
+\end{document}
